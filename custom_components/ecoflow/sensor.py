@@ -23,7 +23,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util.dt import utcnow
 from reactivex import Observable
 
-from . import DOMAIN, EcoFlowEntity, HassioEcoFlowClient, select_bms
+from . import DOMAIN, EcoFlowBaseEntity, EcoFlowEntity, HassioEcoFlowClient, select_bms
 from .ecoflow import is_delta, is_delta_mini, is_delta_pro, is_power_station, is_river
 
 
@@ -57,7 +57,6 @@ async def async_setup_entry(
                     client, client.inverter, "ac_out_freq", "AC output frequency"
                 ),
                 RemainEntity(client, client.pd, "remain_display", "Remain"),
-                LevelEntity(client, client.pd, "battery_level", "Battery"),
                 VoltageEntity(
                     client, client.inverter, "ac_in_voltage", "AC input voltage"
                 ),
@@ -80,6 +79,8 @@ async def async_setup_entry(
                 WattsEntity(client, client.pd, "usb_out2_power", "USB-A right output"),
             ]
         )
+        if not (is_delta(client.product) and not is_delta_mini(client.product)):
+            entities.append(LevelEntity(client, client.pd, "battery_level", "Battery"))
         if is_delta(client.product):
             bms = (
                 client.bms.pipe(select_bms(0), ops.share()),
@@ -153,6 +154,9 @@ async def async_setup_entry(
                     ]
                 )
             else:
+                entities.append(
+                    CombinedLevelEntity(client, list(bms), "Battery")
+                )
                 entities.extend(
                     [
                         CyclesEntity(
@@ -367,6 +371,65 @@ class SingleLevelEntity(LevelEntity):
             self._attr_extra_state_attributes["capacity_design"] = data[
                 "battery_capacity_design"
             ]
+
+
+class CombinedLevelEntity(SensorEntity, EcoFlowBaseEntity):
+    """Battery level computed from the capacity-weighted sum of all connected BMS packs."""
+
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(
+        self,
+        client: HassioEcoFlowClient,
+        bms_streams: list[Observable[dict[str, Any]]],
+        name: str,
+    ):
+        super().__init__(client)
+        self._attr_name = name
+        # Match the unique_id that LevelEntity(... "battery_level" ...) would produce
+        # so that existing entity history is preserved on upgrade.
+        self._attr_unique_id += "-battery-level"
+        self._bms_streams = bms_streams
+        self._capacities: dict[int, dict[str, int]] = {}
+        self._attr_extra_state_attributes = {}
+
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        for idx, stream in enumerate(self._bms_streams):
+            self._subscribe(stream, lambda data, i=idx: self._on_bms_updated(i, data))
+        self._subscribe(self._client.disconnected, self._on_bms_disconnected)
+
+    def _on_bms_disconnected(self, bms_id: Optional[int]):
+        # Full disconnect (bms_id=None) is already handled by the base class.
+        # For a specific extra-battery disconnect, purge its stale capacity data.
+        if bms_id is not None and bms_id in self._capacities:
+            del self._capacities[bms_id]
+            self._recompute()
+            self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
+
+    def _on_bms_updated(self, idx: int, data: dict[str, Any]):
+        if "battery_capacity_remain" in data and "battery_capacity_full" in data:
+            self._capacities[idx] = {
+                "remain": data["battery_capacity_remain"],
+                "full": data["battery_capacity_full"],
+            }
+        self._recompute()
+        self._attr_available = True
+        self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
+
+    def _recompute(self):
+        total_remain = sum(c["remain"] for c in self._capacities.values())
+        total_full = sum(c["full"] for c in self._capacities.values())
+        if total_full > 0:
+            self._attr_native_value = round(total_remain / total_full * 100)
+            self._attr_extra_state_attributes = {
+                "capacity_remain": total_remain,
+                "capacity_full": total_full,
+            }
+        else:
+            self._attr_native_value = None
 
 
 class TempEntity(BaseEntity):
